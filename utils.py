@@ -42,8 +42,8 @@ def convert_image(img, source, target):
         img = (img + 1.) / 2.
 
     elif source == 'cv2':
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = torch.from_numpy(img).permute(0,1,2)/255.0
+        # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = torch.from_numpy(img).permute(2,0,1)/255.0
 
     # Convert from [0, 1] to target
     if target == 'pil':
