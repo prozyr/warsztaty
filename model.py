@@ -9,104 +9,188 @@ from torchvision import models, transforms
 from torchvision.models.feature_extraction import create_feature_extractor
 
 """ SRResNet """
+class ConvolutionalBlock(nn.Module):
+    """
+    A convolutional block, comprising convolutional, BN, activation layers.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, batch_norm=False, activation=None):
+        """
+        :param in_channels: number of input channels
+        :param out_channels: number of output channe;s
+        :param kernel_size: kernel size
+        :param stride: stride
+        :param batch_norm: include a BN layer?
+        :param activation: Type of activation; None if none
+        """
+        super(ConvolutionalBlock, self).__init__()
+
+        if activation is not None:
+            activation = activation.lower()
+            assert activation in {'prelu', 'leakyrelu', 'tanh'}
+
+        # A container that will hold the layers in this convolutional block
+        layers = list()
+
+        # A convolutional layer
+        layers.append(
+            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride,
+                      padding=kernel_size // 2))
+
+        # A batch normalization (BN) layer, if wanted
+        if batch_norm is True:
+            layers.append(nn.BatchNorm2d(num_features=out_channels))
+
+        # An activation layer, if wanted
+        if activation == 'prelu':
+            layers.append(nn.PReLU())
+        elif activation == 'leakyrelu':
+            layers.append(nn.LeakyReLU(0.2))
+        elif activation == 'tanh':
+            layers.append(nn.Tanh())
+
+        # Put together the convolutional block as a sequence of the layers in this container
+        self.conv_block = nn.Sequential(*layers)
+
+    def forward(self, input):
+        """
+        Forward propagation.
+
+        :param input: input images, a tensor of size (N, in_channels, w, h)
+        :return: output images, a tensor of size (N, out_channels, w, h)
+        """
+        output = self.conv_block(input)  # (N, out_channels, w, h)
+
+        return output
+
+
+class SubPixelConvolutionalBlock(nn.Module):
+    """
+    A subpixel convolutional block, comprising convolutional, pixel-shuffle, and PReLU activation layers.
+    """
+
+    def __init__(self, kernel_size=3, n_channels=64, scaling_factor=2):
+        """
+        :param kernel_size: kernel size of the convolution
+        :param n_channels: number of input and output channels
+        :param scaling_factor: factor to scale input images by (along both dimensions)
+        """
+        super(SubPixelConvolutionalBlock, self).__init__()
+
+        # A convolutional layer that increases the number of channels by scaling factor^2, followed by pixel shuffle and PReLU
+        self.conv = nn.Conv2d(in_channels=n_channels, out_channels=n_channels * (scaling_factor ** 2),
+                              kernel_size=kernel_size, padding=kernel_size // 2)
+        # These additional channels are shuffled to form additional pixels, upscaling each dimension by the scaling factor
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor=scaling_factor)
+        self.prelu = nn.PReLU()
+
+    def forward(self, input):
+        """
+        Forward propagation.
+
+        :param input: input images, a tensor of size (N, n_channels, w, h)
+        :return: scaled output images, a tensor of size (N, n_channels, w * scaling factor, h * scaling factor)
+        """
+        output = self.conv(input)  # (N, n_channels * scaling factor^2, w, h)
+        output = self.pixel_shuffle(output)  # (N, n_channels, w * scaling factor, h * scaling factor)
+        output = self.prelu(output)  # (N, n_channels, w * scaling factor, h * scaling factor)
+
+        return output
+
+
+class ResidualBlock(nn.Module):
+    """
+    A residual block, comprising two convolutional blocks with a residual connection across them.
+    """
+
+    def __init__(self, kernel_size=3, n_channels=64):
+        """
+        :param kernel_size: kernel size
+        :param n_channels: number of input and output channels (same because the input must be added to the output)
+        """
+        super(ResidualBlock, self).__init__()
+
+        # The first convolutional block
+        self.conv_block1 = ConvolutionalBlock(in_channels=n_channels, out_channels=n_channels, kernel_size=kernel_size,
+                                              batch_norm=True, activation='PReLu')
+
+        # The second convolutional block
+        self.conv_block2 = ConvolutionalBlock(in_channels=n_channels, out_channels=n_channels, kernel_size=kernel_size,
+                                              batch_norm=True, activation=None)
+
+    def forward(self, input):
+        """
+        Forward propagation.
+
+        :param input: input images, a tensor of size (N, n_channels, w, h)
+        :return: output images, a tensor of size (N, n_channels, w, h)
+        """
+        residual = input  # (N, n_channels, w, h)
+        output = self.conv_block1(input)  # (N, n_channels, w, h)
+        output = self.conv_block2(output)  # (N, n_channels, w, h)
+        output = output + residual  # (N, n_channels, w, h)
+
+        return output
+
+
 class SRResNet(nn.Module):
-    def __init__(
-            self,
-            in_channels: int = 3,
-            out_channels: int = 3,
-            channels: int = 64,
-            num_rcb: int = 16,
-            upscale: int = 4,
-    ) -> None:
+    """
+    The SRResNet, as defined in the paper.
+    """
+
+    def __init__(self, large_kernel_size=9, small_kernel_size=3, n_channels=64, n_blocks=16, scaling_factor=4):
+        """
+        :param large_kernel_size: kernel size of the first and last convolutions which transform the inputs and outputs
+        :param small_kernel_size: kernel size of all convolutions in-between, i.e. those in the residual and subpixel convolutional blocks
+        :param n_channels: number of channels in-between, i.e. the input and output channels for the residual and subpixel convolutional blocks
+        :param n_blocks: number of residual blocks
+        :param scaling_factor: factor to scale input images by (along both dimensions) in the subpixel convolutional block
+        """
         super(SRResNet, self).__init__()
-        # Low frequency information extraction layer
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, channels, (9, 9), (1, 1), (4, 4)),
-            nn.PReLU(),
-        )
 
-        # High frequency information extraction block
-        trunk = []
-        for _ in range(num_rcb):
-            trunk.append(_ResidualConvBlock(channels))
-        self.trunk = nn.Sequential(*trunk)
+        # Scaling factor must be 2, 4, or 8
+        scaling_factor = int(scaling_factor)
+        assert scaling_factor in {2, 4, 8}, "The scaling factor must be 2, 4, or 8!"
 
-        # High-frequency information linear fusion layer
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
-        )
+        # The first convolutional block
+        self.conv_block1 = ConvolutionalBlock(in_channels=3, out_channels=n_channels, kernel_size=large_kernel_size,
+                                              batch_norm=False, activation='PReLu')
 
-        # zoom block
-        upsampling = []
-        if upscale == 2 or upscale == 4 or upscale == 8:
-            for _ in range(int(math.log(upscale, 2))):
-                upsampling.append(_UpsampleBlock(channels, 2))
-        else:
-            raise NotImplementedError(f"Upscale factor `{upscale}` is not support.")
-        self.upsampling = nn.Sequential(*upsampling)
+        # A sequence of n_blocks residual blocks, each containing a skip-connection across the block
+        self.residual_blocks = nn.Sequential(
+            *[ResidualBlock(kernel_size=small_kernel_size, n_channels=n_channels) for i in range(n_blocks)])
 
-        # reconstruction block
-        self.conv3 = nn.Conv2d(channels, out_channels, (9, 9), (1, 1), (4, 4))
+        # Another convolutional block
+        self.conv_block2 = ConvolutionalBlock(in_channels=n_channels, out_channels=n_channels,
+                                              kernel_size=small_kernel_size,
+                                              batch_norm=True, activation=None)
 
-        # Initialize neural network weights
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
+        # Upscaling is done by sub-pixel convolution, with each such block upscaling by a factor of 2
+        n_subpixel_convolution_blocks = int(math.log2(scaling_factor))
+        self.subpixel_convolutional_blocks = nn.Sequential(
+            *[SubPixelConvolutionalBlock(kernel_size=small_kernel_size, n_channels=n_channels, scaling_factor=2) for i
+              in range(n_subpixel_convolution_blocks)])
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+        # The last convolutional block
+        self.conv_block3 = ConvolutionalBlock(in_channels=n_channels, out_channels=3, kernel_size=large_kernel_size,
+                                              batch_norm=False, activation='Tanh')
 
-    # Support torch.script function
-    def _forward_impl(self, x: Tensor) -> Tensor:
-        conv1 = self.conv1(x)
-        x = self.trunk(conv1)
-        x = self.conv2(x)
-        x = torch.add(x, conv1)
-        x = self.upsampling(x)
-        x = self.conv3(x)
+    def forward(self, lr_imgs):
+        """
+        Forward prop.
 
-        x = torch.clamp_(x, 0.0, 1.0)
+        :param lr_imgs: low-resolution input images, a tensor of size (N, 3, w, h)
+        :return: super-resolution output images, a tensor of size (N, 3, w * scaling factor, h * scaling factor)
+        """
+        output = self.conv_block1(lr_imgs)  # (N, 3, w, h)
+        residual = output  # (N, n_channels, w, h)
+        output = self.residual_blocks(output)  # (N, n_channels, w, h)
+        output = self.conv_block2(output)  # (N, n_channels, w, h)
+        output = output + residual  # (N, n_channels, w, h)
+        output = self.subpixel_convolutional_blocks(output)  # (N, n_channels, w * scaling factor, h * scaling factor)
+        sr_imgs = self.conv_block3(output)  # (N, 3, w * scaling factor, h * scaling factor)
 
-        return x
-
-class _ResidualConvBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super(_ResidualConvBlock, self).__init__()
-        self.rcb = nn.Sequential(
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
-            nn.PReLU(),
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-
-        x = self.rcb(x)
-
-        x = torch.add(x, identity)
-
-        return x
-    
-class _UpsampleBlock(nn.Module):
-    def __init__(self, channels: int, upscale_factor: int) -> None:
-        super(_UpsampleBlock, self).__init__()
-        self.upsample_block = nn.Sequential(
-            nn.Conv2d(channels, channels * upscale_factor * upscale_factor, (3, 3), (1, 1), (1, 1)),
-            nn.PixelShuffle(upscale_factor),
-            nn.PReLU(),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.upsample_block(x)
-
-        return x
+        return sr_imgs
     
 
 """ RDDBNet """""
@@ -595,5 +679,74 @@ class _ResidualBlock(nn.Module):
 
 """ SRCNN """
 
+class SRCNN(nn.Module):
+    def __init__(self, scale_factor=2) -> None:
+        super(SRCNN, self).__init__()
+
+        # Bilinear upsample
+        self.upsample = nn.UpsamplingBilinear2d(scale_factor=scale_factor)
+
+        # Feature extraction layer.
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, (9, 9), (1, 1), (4, 4)),
+            nn.ReLU(True)
+        )
+
+        # Non-linear mapping layer.
+        self.map = nn.Sequential(
+            nn.Conv2d(64, 32, (5, 5), (1, 1), (2, 2)),
+            nn.ReLU()
+        )
+
+        # Rebuild the layer.
+        self.reconstruction = nn.Conv2d(32, 3, (5, 5), (1, 1), (2, 2))
+
+        self.tanh = nn.Tanh()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.upsample(x)
+        out = self.features(out)
+        out = self.map(out)
+        out = self.tanh(self.reconstruction(out))
+        return out
+
 """ FSRCNN """
 
+class FSRCNN(nn.Module):
+    def __init__(self, d=48, s=12, m=2, upscale=2):
+        super().__init__()
+        
+        # Feature extraction layer
+        self.fe_layer = nn.Conv2d(in_channels=3, out_channels=d, kernel_size=7, stride=1, padding=3, dilation=1, groups=1, bias=True, padding_mode='zeros')
+        
+        # Shrinking layer
+        self.sh_layer = nn.Conv2d(in_channels=d, out_channels=s, kernel_size=1, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros')
+        
+        # Mapping layer
+        self.m = m
+        for i in range(m):
+            setattr(self, f'map_layer{i+1}', nn.Conv2d(in_channels=s, out_channels=s, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, bias=True, padding_mode='zeros'))
+        
+        # Expanding layer
+        self.ex_layer = nn.Conv2d(in_channels=s, out_channels=d, kernel_size=1, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros')
+        
+        # Deconvolution layer
+        self.deconv1 = nn.Conv2d(in_channels=d, out_channels=s*upscale*upscale, kernel_size=7, stride=1, padding=3, dilation=1, groups=1, bias=True, padding_mode='zeros')
+        self.deconv2 = nn.PixelShuffle(upscale_factor=upscale)
+        self.deconv3 = nn.Conv2d(in_channels=s, out_channels=3, kernel_size=1, stride=1, padding=0, dilation=1, groups=3, bias=True, padding_mode='zeros')
+        
+        self.relu = nn.ReLU()
+        self.prelu = nn.PReLU()
+        self.tanh = nn.Tanh()
+        
+    def forward(self, x):
+        out = self.prelu(self.fe_layer(x))
+        out = self.prelu(self.sh_layer(out))
+        res_out1 = out
+        for i in range(self.m):
+            out = self.prelu(getattr(self, f'map_layer{i+1}')(out))
+        out = self.prelu(self.ex_layer(out+res_out1))
+        out = self.relu(self.deconv1(out))
+        out = self.relu(self.deconv2(out))
+        out = self.tanh(self.deconv3(out))
+        return out
